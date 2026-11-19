@@ -25,7 +25,9 @@ export function err(res: ServerResponse, status: number, message: string, extra:
 }
 
 export function pathOf(req: IncomingMessage): string {
-  try { return new URL(req.url ?? '/', 'http://entry').pathname; } catch { return '/'; }
+  const u = req.url ?? '/';
+  const q = u.indexOf('?');
+  return q < 0 ? u : u.slice(0, q);
 }
 export async function readBody(req: IncomingMessage): Promise<Buffer> {
   const chunks: Buffer[] = [];
