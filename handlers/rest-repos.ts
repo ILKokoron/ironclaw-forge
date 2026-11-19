@@ -16,6 +16,7 @@ import { createHash } from 'node:crypto';
 import type { Ctx } from '../app.ts';
 import { store, type Repo, type FileObj, type CommitObj } from '../store.ts';
 import { sendJson, err, readJson } from '../http.ts';
+import { cachedJson, invalidateJsonCache, takeParsed } from './rest-protocol.ts';
 
 // The contest scenario seed is a fixed constant, so the login the single bearer
 // token names never changes between trials. Repos created through POST /user/repos
@@ -193,7 +194,8 @@ async function handleUserRepos(ctx: Ctx, method: string): Promise<boolean> {
   if (!needAuth(ctx)) return true;
 
   if (method === 'POST') {
-    const parsed = await readJson(ctx.req);
+    // The protocol pre-parser already validated and parsed this body; reuse it.
+    const parsed = takeParsed(ctx.req) ?? await readJson(ctx.req);
     if (!parsed.ok || typeof parsed.value !== 'object' || parsed.value === null || Array.isArray(parsed.value)) {
       err(ctx.res, 400, 'Invalid JSON body');
       return true;
@@ -212,6 +214,7 @@ async function handleUserRepos(ctx: Ctx, method: string): Promise<boolean> {
     const isPrivate = body.private === true;
     const description = typeof body.description === 'string' ? body.description : '';
     const repo = createRepo(name, isPrivate, description);
+    invalidateJsonCache();
     sendJson(ctx.res, 201, repoJson(repo));
     return true;
   }
@@ -223,13 +226,13 @@ async function handleUserRepos(ctx: Ctx, method: string): Promise<boolean> {
     const rawPage = Number.parseInt(query.get('page') ?? '1', 10);
     const page = Number.isFinite(rawPage) && rawPage > 0 ? rawPage : 1;
     const all = [...store.repos.values()].filter((repo) => repo.owner === viewer());
-    const slice = all.slice((page - 1) * perPage, page * perPage).map(repoJson);
     const headers: Record<string, string> = {};
     if (page * perPage < all.length) {
       const next = `http://${hostOf(ctx)}${ctx.path}?per_page=${perPage}&page=${page + 1}`;
       headers.link = `<${next}>; rel="next"`;
     }
-    sendJson(ctx.res, 200, slice, headers);
+    const key = `userrepos|${viewer()}|${hostOf(ctx)}|${ctx.req.url ?? ''}|${store.seqGlobal}`;
+    cachedJson(ctx, 200, key, () => all.slice((page - 1) * perPage, page * perPage).map(repoJson), headers);
     return true;
   }
 
@@ -238,7 +241,9 @@ async function handleUserRepos(ctx: Ctx, method: string): Promise<boolean> {
 
 async function handleRepoRoot(ctx: Ctx, method: string, repo: Repo): Promise<boolean> {
   if (method === 'GET') {
-    sendJson(ctx.res, 200, repoJson(repo));
+    // repoJson() depends only on these fields; the fingerprint makes the key self-invalidating.
+    const key = `repo|${store.repoKey(repo.owner, repo.name)}|${repo.id}|${repo.private}|${repo.description}|${repo.default_branch}`;
+    cachedJson(ctx, 200, key, () => repoJson(repo));
     return true;
   }
   if (method === 'PATCH') {
@@ -250,6 +255,7 @@ async function handleRepoRoot(ctx: Ctx, method: string, repo: Repo): Promise<boo
     const body = parsed.value as Json;
     if (typeof body.description === 'string') repo.description = body.description;
     if (typeof body.private === 'boolean') repo.private = body.private;
+    invalidateJsonCache();
     sendJson(ctx.res, 200, repoJson(repo));
     return true;
   }
@@ -257,6 +263,7 @@ async function handleRepoRoot(ctx: Ctx, method: string, repo: Repo): Promise<boo
     store.repos.delete(store.repoKey(repo.owner, repo.name));
     store.issues.delete(store.repoKey(repo.owner, repo.name));
     store.pulls.delete(store.repoKey(repo.owner, repo.name));
+    invalidateJsonCache();
     sendJson(ctx.res, 204, {});
     return true;
   }

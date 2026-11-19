@@ -104,6 +104,17 @@ function findPullByGid(id: unknown): { repo: any; pull: any } | null {
 
 interface Tok { t: 'name' | 'string' | 'number' | 'var' | 'punct'; v: any }
 
+// Character-code predicates for the per-character scan loops. The old code ran a RegExp `.test()`
+// on every character; these are integer compares and keep the exact same accepted character sets.
+// `\s` is intentionally left as a RegExp so Unicode whitespace semantics stay byte-for-byte identical.
+const isDigitCode = (cc: number): boolean => cc >= 48 && cc <= 57;
+const isNameStartCode = (cc: number): boolean =>
+  (cc >= 65 && cc <= 90) || (cc >= 97 && cc <= 122) || cc === 95; // A-Z a-z _
+const isNameCode = (cc: number): boolean => isNameStartCode(cc) || isDigitCode(cc) || cc === 45; // + -
+const isVarCode = (cc: number): boolean => isNameStartCode(cc) || isDigitCode(cc); // [A-Za-z0-9_]
+const isNumCode = (cc: number): boolean =>
+  isDigitCode(cc) || cc === 46 || cc === 69 || cc === 101 || cc === 43 || cc === 45; // . e E + -
+
 function tokenize(src: string): Tok[] {
   const toks: Tok[] = [];
   let i = 0;
@@ -116,7 +127,7 @@ function tokenize(src: string): Tok[] {
     if (c === '$') {
       i += 1;
       const s = i;
-      while (i < n && /[A-Za-z0-9_]/.test(src[i])) i += 1;
+      while (i < n && isVarCode(src.charCodeAt(i))) i += 1;
       toks.push({ t: 'var', v: src.slice(s, i) });
       continue;
     }
@@ -136,15 +147,16 @@ function tokenize(src: string): Tok[] {
       toks.push({ t: 'string', v: out });
       continue;
     }
-    if (/[0-9]/.test(c) || (c === '-' && /[0-9]/.test(src[i + 1] ?? ''))) {
+    const cc = src.charCodeAt(i);
+    if (isDigitCode(cc) || (c === '-' && isDigitCode(src.charCodeAt(i + 1)))) {
       const s = i; i += 1;
-      while (i < n && /[0-9.eE+\-]/.test(src[i])) i += 1;
+      while (i < n && isNumCode(src.charCodeAt(i))) i += 1;
       toks.push({ t: 'number', v: Number(src.slice(s, i)) });
       continue;
     }
-    if (/[A-Za-z_]/.test(c)) {
+    if (isNameStartCode(cc)) {
       const s = i; i += 1;
-      while (i < n && /[A-Za-z0-9_-]/.test(src[i])) i += 1;
+      while (i < n && isNameCode(src.charCodeAt(i))) i += 1;
       toks.push({ t: 'name', v: src.slice(s, i) });
       continue;
     }
@@ -164,6 +176,9 @@ interface Selection {
   args?: Record<string, any>;
   selections?: Selection[];
 }
+
+/** Hoisted: avoids allocating an array literal per operation during parse. */
+const OP_TYPE_SET = new Set(['query', 'mutation', 'subscription']);
 
 class Parser {
   private pos = 0;
@@ -202,7 +217,7 @@ class Parser {
     while (this.pos < this.toks.length) {
       let type = 'query';
       const t = this.peek();
-      if (t !== undefined && t.t === 'name' && ['query', 'mutation', 'subscription'].includes(t.v)) {
+      if (t !== undefined && t.t === 'name' && OP_TYPE_SET.has(t.v)) {
         type = this.next().v;
         if (this.peek()?.t === 'name') this.pos += 1; // operation name
         if (this.isPunct('(')) this.skipBalanced(); // variable definitions
@@ -635,6 +650,49 @@ function mutationMergePullRequest(input: any) {
   return tag({ pullRequest: pullSource(found.repo, found.pull) }, 'MergePullRequestPayload');
 }
 
+// --------------------------------------------------------------------------- parse + result caches
+//
+// gh / github-mcp-server (and the conformance suite) resend the same small set of documents many times.
+// Parsing a document is pure — the executor only reads the parsed selections, never mutates them — and
+// introspection (__type/__schema) is a pure function of the static schema. Both are safe to memoize.
+// Every cache key is a pure function of the request bytes and the current store state: no clock,
+// no randomness. Mutations are never cached (they change state).
+
+type ParsedOp = { type: string; selections: Selection[] };
+
+/** query string -> parsed operations. Values are immutable inputs to the executor. */
+const documentCache = new Map<string, ParsedOp[]>();
+/** (query | variables) -> result, for pure-schema introspection only (never depends on store state). */
+const introspectionCache = new Map<string, Record<string, any>>();
+const DOCUMENT_CACHE_CAP = 4096;
+const INTROSPECTION_CACHE_CAP = 4096;
+
+function parseCached(query: string): ParsedOp[] {
+  let ops = documentCache.get(query);
+  if (ops === undefined) {
+    ops = new Parser(tokenize(query)).parseDocument();
+    if (documentCache.size >= DOCUMENT_CACHE_CAP) documentCache.clear();
+    documentCache.set(query, ops);
+  }
+  return ops;
+}
+
+/** True when every root field is a static introspection field: its result cannot depend on store state. */
+function isStaticQuery(ops: readonly ParsedOp[]): boolean {
+  if (ops.length === 0) return false;
+  for (const op of ops) {
+    for (const sel of op.selections) {
+      if (sel.kind !== 'field' || (sel.name !== '__type' && sel.name !== '__schema')) return false;
+    }
+  }
+  return true;
+}
+
+/** Stable cache-key component for a request's variables object. */
+function variableKey(variables: Record<string, any>): string {
+  try { return JSON.stringify(variables); } catch { return ''; }
+}
+
 // --------------------------------------------------------------------------- execution
 
 function resolveValue(v: any, variables: Record<string, any>): any {
@@ -693,13 +751,21 @@ function executeSelectionSet(selections: Selection[], source: any, env: Env): an
 
 function executeOne(body: Record<string, any>): Record<string, any> {
   const variables = isRecord(body.variables) ? body.variables : {};
+  const query = typeof body.query === 'string' ? body.query : '';
   const env: Env = { variables, errors: [] };
+  let introKey: string | null = null;
   let data: any = null;
   try {
-    const query = typeof body.query === 'string' ? body.query : '';
-    const ops = new Parser(tokenize(query)).parseDocument();
+    const ops = parseCached(query);
     const op = ops[0];
     if (!op) throw new Error('The document contains no operation');
+    // Only pure-schema introspection is memoized: its result depends solely on the static schema and
+    // the request bytes, never on store state. State-dependent queries and all mutations always execute.
+    if (op.type !== 'mutation' && isStaticQuery(ops)) {
+      introKey = `${query}\u0000${variableKey(variables)}`;
+      const cached = introspectionCache.get(introKey);
+      if (cached !== undefined) return cached;
+    }
     const root = tag({}, op.type === 'mutation' ? 'Mutation' : 'Query');
     data = executeSelectionSet(op.selections, root, env);
   } catch (e) {
@@ -708,6 +774,10 @@ function executeOne(body: Record<string, any>): Record<string, any> {
   }
   const result: Record<string, any> = { data };
   if (env.errors.length > 0) result.errors = env.errors;
+  if (introKey !== null) {
+    if (introspectionCache.size >= INTROSPECTION_CACHE_CAP) introspectionCache.clear();
+    introspectionCache.set(introKey, result);
+  }
   return result;
 }
 

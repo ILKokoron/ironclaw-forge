@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import type { Ctx } from '../app.ts';
 import { store, type Repo, type Pull } from '../store.ts';
 import { err, readJson, sendJson } from '../http.ts';
+import { cachedJson, invalidateJsonCache } from './rest-protocol.ts';
 
 type PullEx = Pull & { mergedAt?: string; mergeCommitSha?: string };
 

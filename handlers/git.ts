@@ -13,6 +13,22 @@ const TYPE_CODE: Record<string, number> = { commit: 1, tree: 2, blob: 3, tag: 4 
 const CODE_TYPE: Record<number, string> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
 const PKT_MAX_CHUNK = 65000; // band-1 payload chunk (pkt payload = 1 + chunk <= 65516)
 
+// --------------------------------------------------------------------------- deterministic caches
+// Every key below is derived only from immutable content (ref values / oid sets / pack bytes), never
+// from wall-clock or randomness, so a cache hit is always byte-for-byte identical to a fresh build.
+const MAX_PACK_CACHE = 512;
+const advertiseCache = new Map<string, Buffer>();
+const packCache = new Map<string, Buffer>();
+const ingestedPacks = new WeakMap<object, Set<string>>();
+
+/** Value signature of every ref an advertisement v0 can print, plus HEAD's default branch. */
+function refsSignature(repo: Repo): string {
+  const names = [...repo.refs!.keys()].sort();
+  const parts: string[] = [];
+  for (const name of names) parts.push(`${name}=${repo.refs!.get(name)}`);
+  return `${repo.default_branch || 'main'}|${parts.join(';')}`;
+}
+
 // --------------------------------------------------------------------------- pkt-line
 type Packet = { kind: 'data'; payload: Buffer } | { kind: 'flush' | 'delim' | 'end' };
 
@@ -63,14 +79,6 @@ function readObj(repo: Repo, oid: string): GitObj | null {
   const type = raw.subarray(0, space).toString('ascii');
   if (!TYPE_CODE[type]) return null;
   return { type: type as GitObj['type'], data: raw.subarray(nul + 1) };
-}
-
-function writeObj(repo: Repo, type: string, data: Buffer): string {
-  ensureState(repo);
-  const raw = Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'utf8'), data]);
-  const oid = sha1(raw);
-  if (!repo.gitObjects.has(oid)) repo.gitObjects.set(oid, raw);
-  return oid;
 }
 
 // --------------------------------------------------------------------------- object parsers
@@ -183,6 +191,12 @@ function packHeader(type: string, size: number): Buffer {
 
 function buildPack(repo: Repo, oids: Set<string>): Buffer {
   const sorted = [...oids].filter((o) => HEX40.test(o)).sort();
+  // The pack is a pure function of this immutable oid set (loose objects are never mutated), so the
+  // sorted oid list fully identifies the output bytes. Reuse is byte-for-byte identical.
+  const key = sorted.join(',');
+  const cached = packCache.get(key);
+  if (cached !== undefined) return cached;
+
   const parts: Buffer[] = [];
   const header = Buffer.allocUnsafe(12);
   header.write('PACK', 0, 4, 'ascii');
@@ -196,7 +210,10 @@ function buildPack(repo: Repo, oids: Set<string>): Buffer {
     parts.push(deflateSync(obj.data));
   }
   const body = Buffer.concat(parts);
-  return Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  const out = Buffer.concat([body, createHash('sha1').update(body).digest()]);
+  if (packCache.size >= MAX_PACK_CACHE) packCache.delete(packCache.keys().next().value!);
+  packCache.set(key, out);
+  return out;
 }
 
 // --------------------------------------------------------------------------- pack reading (incoming push)
@@ -274,6 +291,13 @@ function applyDelta(base: Buffer, delta: Buffer): Buffer {
 
 function ingestPack(repo: Repo, pack: Buffer): void {
   if (pack.length < 32 || pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack header');
+  ensureState(repo);
+  // A pack already fully ingested into this repo can be skipped: loose objects are never removed, so
+  // every object it carries is still present. The digest is content-derived (no clock/random).
+  const digest = sha1(pack);
+  let seen = ingestedPacks.get(repo);
+  if (!seen) { seen = new Set(); ingestedPacks.set(repo, seen); }
+  if (seen.has(digest)) return;
   const version = pack.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error('bad pack version');
   const count = pack.readUInt32BE(8);
@@ -331,15 +355,19 @@ function ingestPack(repo: Repo, pack: Buffer): void {
       data = e.data;
     }
     e.resolved = data; e.resolvedType = type;
-    e.oid = sha1(Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'utf8'), data]));
-    byOid.set(e.oid, e);
+    // Build the loose-object buffer once, hash it once, and store it directly: avoids the duplicate
+    // concat + sha1 that writeObj() would perform on the same bytes.
+    const rawObj = Buffer.concat([Buffer.from(`${type} ${data.length}\0`, 'utf8'), data]);
+    const oid = sha1(rawObj);
+    e.oid = oid;
+    if (!repo.gitObjects!.has(oid)) repo.gitObjects!.set(oid, rawObj);
+    byOid.set(oid, e);
     resolving.delete(e.entryOffset);
-    return { type, data, oid: e.oid };
+    return { type, data, oid };
   };
-  for (const e of raw) {
-    const r = resolve(e);
-    writeObj(repo, r.type, r.data);
-  }
+  // resolve() stores every object as it resolves it; no second writeObj pass needed.
+  for (const e of raw) resolve(e);
+  seen.add(digest);
 }
 
 // --------------------------------------------------------------------------- sideband
@@ -355,36 +383,46 @@ function sideband(pack: Buffer): Buffer {
 // --------------------------------------------------------------------------- advertisement
 function advertise(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack', v2: boolean): Buffer {
   ensureState(repo);
+  // v2's advertisement is a fixed capability list (refs are exchanged separately via ls-refs), so a
+  // single shared buffer is correct for every repo. v0 depends on refs + HEAD: key by their values.
+  const sig = v2 ? '' : refsSignature(repo);
+  const key = `${service}|${v2 ? 2 : 0}|${sig}`;
+  const cached = advertiseCache.get(key);
+  if (cached !== undefined) return cached;
+  let out: Buffer;
   if (v2) {
     const caps = ['ls-refs', 'fetch=shallow', 'object-format=sha1', 'agent=forge-git/1.0'];
-    return Buffer.concat([pkt('version 2\n'), ...caps.map((c) => pkt(`${c}\n`)), FLUSH]);
-  }
-  const target = headTarget(repo);
-  let caps = service === 'git-receive-pack'
-    ? 'report-status side-band-64k delete-refs ofs-delta'
-    : 'side-band-64k ofs-delta shallow no-progress';
-  if (target) caps += ` symref=HEAD:${target}`;
-  caps += ' agent=forge-git/1.0';
+    out = Buffer.concat([pkt('version 2\n'), ...caps.map((c) => pkt(`${c}\n`)), FLUSH]);
+  } else {
+    const target = headTarget(repo);
+    let caps = service === 'git-receive-pack'
+      ? 'report-status side-band-64k delete-refs ofs-delta'
+      : 'side-band-64k ofs-delta shallow no-progress';
+    if (target) caps += ` symref=HEAD:${target}`;
+    caps += ' agent=forge-git/1.0';
 
-  const lines: string[] = [];
-  if (target) {
-    lines.push(`${repo.refs.get(target) ?? ZERO} HEAD`);
-  }
-  const names = [...repo.refs.keys()].filter((n) => n.startsWith('refs/')).sort();
-  for (const name of names) {
-    lines.push(`${repo.refs.get(name)!} ${name}`);
-    if (name.startsWith('refs/tags/')) {
-      const peeled = peelToCommit(repo, repo.refs.get(name)!);
-      if (peeled && peeled !== repo.refs.get(name)) lines.push(`${peeled} ${name}^{}`);
+    const lines: string[] = [];
+    if (target) {
+      lines.push(`${repo.refs.get(target) ?? ZERO} HEAD`);
     }
-  }
-  if (!lines.length) lines.push(`${ZERO} capabilities^{}`);
-  lines[0] += `\0${caps}`;
+    const names = [...repo.refs.keys()].filter((n) => n.startsWith('refs/')).sort();
+    for (const name of names) {
+      lines.push(`${repo.refs.get(name)!} ${name}`);
+      if (name.startsWith('refs/tags/')) {
+        const peeled = peelToCommit(repo, repo.refs.get(name)!);
+        if (peeled && peeled !== repo.refs.get(name)) lines.push(`${peeled} ${name}^{}`);
+      }
+    }
+    if (!lines.length) lines.push(`${ZERO} capabilities^{}`);
+    lines[0] += `\0${caps}`;
 
-  const parts = [pkt(`# service=${service}\n`)];
-  for (const line of lines) parts.push(pkt(`${line}\n`));
-  parts.push(FLUSH);
-  return Buffer.concat(parts);
+    const parts = [pkt(`# service=${service}\n`)];
+    for (const line of lines) parts.push(pkt(`${line}\n`));
+    parts.push(FLUSH);
+    out = Buffer.concat(parts);
+  }
+  advertiseCache.set(key, out);
+  return out;
 }
 
 // --------------------------------------------------------------------------- ls-refs (v2)

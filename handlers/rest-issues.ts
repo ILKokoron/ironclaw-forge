@@ -7,6 +7,7 @@
 import type { Ctx } from '../app.ts';
 import { store, gid, type Issue, type Comment } from '../store.ts';
 import { sendJson, err, readJson } from '../http.ts';
+import { cachedJson, invalidateJsonCache } from './rest-protocol.ts';
 
 const CREATED_AT = '2024-01-01T00:00:00Z';
 
@@ -121,6 +122,23 @@ function findIssue(repoKey: string, number: number): Issue | undefined {
   return store.issuesOf(repoKey).find((issue) => issue.number === number);
 }
 
+// Cheap, deterministic fingerprints of every field that can reach a cached JSON body.
+// Including these in cache keys means a mutation from ANY surface (REST / GraphQL / MCP)
+// produces a new key, so cached replies can never go stale without an explicit hook.
+function issueSig(i: Issue): string {
+  return `${i.number}|${i.state}|${i.id}|${i.comments.length}|${i.labels.join('~')}|${i.title}\u0001${i.body}`;
+}
+function issueSetSig(list: readonly Issue[]): string {
+  let sig = '';
+  for (const i of list) sig += issueSig(i) + '\u0002';
+  return sig;
+}
+function commentSetSig(list: readonly Comment[]): string {
+  let sig = '';
+  for (const c of list) sig += `${c.id}|${c.body}\u0002`;
+  return sig;
+}
+
 export async function handleIssues(ctx: Ctx): Promise<boolean> {
   const p = ctx.parts;
   // Only /api/v3/repos/{owner}/{repo}/issues[...] (and /labels) are ours.
@@ -142,6 +160,7 @@ export async function handleIssues(ctx: Ctx): Promise<boolean> {
       const color = typeof body.color === 'string' ? body.color : 'ededed';
       if (!name) { err(ctx.res, 422, 'Validation Failed: name is required'); return true; }
       rememberLabel(repoKey, name);
+      invalidateJsonCache();
       const s = store as unknown as Record<string, unknown>;
       if (s.labels instanceof Map) {
         const m = s.labels as Map<string, Set<string>>;
@@ -181,7 +200,10 @@ export async function handleIssues(ctx: Ctx): Promise<boolean> {
         next.searchParams.set('page', String(page + 1));
         headers.Link = `<${next.toString()}>; rel="next"`;
       }
-      sendJson(ctx.res, 200, slice.map(issueView), headers);
+      // Fingerprint covers every issue plus the full raw URL (all query params) and
+      // Host, so pagination Link headers are correct for the exact cached key.
+      const key = `issues|${repoKey}|${ctx.req.headers.host ?? ''}|${ctx.req.url ?? ''}|${issueSetSig(issues)}`;
+      cachedJson(ctx, 200, key, () => slice.map(issueView), headers);
       return true;
     }
 
@@ -207,6 +229,7 @@ export async function handleIssues(ctx: Ctx): Promise<boolean> {
         comments: [],
       };
       store.issuesOf(repoKey).push(issue);
+      invalidateJsonCache();
       sendJson(ctx.res, 201, issueView(issue));
       return true;
     }
@@ -221,7 +244,8 @@ export async function handleIssues(ctx: Ctx): Promise<boolean> {
     const issue = findIssue(repoKey, number);
     if (!issue) { err(ctx.res, 404, 'Not Found'); return true; }
     if (method === 'GET') {
-      sendJson(ctx.res, 200, issueView(issue));
+      const key = `issue|${repoKey}|${number}|${issueSig(issue)}`;
+      cachedJson(ctx, 200, key, () => issueView(issue));
       return true;
     }
     if (method === 'PATCH') {
@@ -231,6 +255,7 @@ export async function handleIssues(ctx: Ctx): Promise<boolean> {
       if (body.state === 'open' || body.state === 'closed') issue.state = body.state;
       if (typeof body.title === 'string') issue.title = body.title;
       if (typeof body.body === 'string') issue.body = body.body;
+      invalidateJsonCache();
       sendJson(ctx.res, 200, issueView(issue));
       return true;
     }
@@ -241,7 +266,8 @@ export async function handleIssues(ctx: Ctx): Promise<boolean> {
     const issue = findIssue(repoKey, number);
     if (!issue) { err(ctx.res, 404, 'Not Found'); return true; }
     if (method === 'GET') {
-      sendJson(ctx.res, 200, issue.comments.map(commentView));
+      const key = `comments|${repoKey}|${number}|${commentSetSig(issue.comments)}`;
+      cachedJson(ctx, 200, key, () => issue.comments.map(commentView));
       return true;
     }
     if (method === 'POST') {
@@ -253,6 +279,7 @@ export async function handleIssues(ctx: Ctx): Promise<boolean> {
         body: typeof body.body === 'string' ? body.body : '',
       };
       issue.comments.push(comment);
+      invalidateJsonCache();
       sendJson(ctx.res, 201, commentView(comment));
       return true;
     }
